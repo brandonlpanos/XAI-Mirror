@@ -1,8 +1,8 @@
-# XAI Object Lab
+# XAI Object
 
 **Multi-method, real-time explainability showcase for image object recognition.**
 
-Built for the FHNW I4DS XAI Lab. Runs eight fundamentally different explanation
+Built for the FHNW I4DS XAI group. Runs eight fundamentally different explanation
 methods side-by-side on a live webcam stream or uploaded photo, using a pair of
 ViT-based models — one self-supervised, one supervised — to contrast what each
 paradigm reveals.
@@ -227,7 +227,7 @@ from captum.concept import TCAV
 
 ```
 @misc{xai_object_lab_2025,
-  title  = {XAI Object Lab: Multi-method real-time explainability for image recognition},
+  title  = {XAI Object: Multi-method real-time explainability for image recognition},
   author = {Panos, Brandon and I4DS, FHNW},
   year   = {2025},
   url    = {https://github.com/brandonlpanos/XAI-Mirror}

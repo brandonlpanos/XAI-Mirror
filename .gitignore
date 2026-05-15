@@ -1,4 +1,4 @@
-assets/
+assets/gen_arch.py
 .DS_Store
 papers/
 xai-venv/
