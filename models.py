@@ -1,14 +1,12 @@
 """
 models.py — model wrappers for:
-  • DinoExtractor  : DINOv2-small, self-supervised attention
-  • EmotionClassifier : ViT-B/16 fine-tuned for 7 facial emotions
-  • FaceDetector   : MediaPipe face crop utility
+  • DinoExtractor    : DINOv2-small, self-supervised attention
+  • ObjectClassifier : ViT-B/16 fine-tuned on ImageNet-1k (1000 classes)
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
-from PIL import Image
 from transformers import AutoModel, AutoImageProcessor, AutoModelForImageClassification
 
 import config
@@ -41,7 +39,7 @@ class DinoExtractor(nn.Module):
         self.processor = AutoImageProcessor.from_pretrained(config.DINO_MODEL_ID)
         self.model = AutoModel.from_pretrained(
             config.DINO_MODEL_ID,
-            add_pooling_layer=False,
+            attn_implementation="eager",
         ).to(DEVICE)
         self.model.eval()
         self._n = config.DINO_PATCHES_PER_SIDE
@@ -58,9 +56,8 @@ class DinoExtractor(nn.Module):
         Returns: float32 tensor (num_heads, H_patches, W_patches)
         """
         outputs = self.model(pixel_values=pixel_values, output_attentions=True)
-        # outputs.attentions: tuple of (1, heads, seq, seq) per layer
         last = outputs.attentions[-1]            # (1, 6, 257, 257)
-        cls_attn = last[0, :, 0, 1:]             # (6, 256)  — skip CLS token
+        cls_attn = last[0, :, 0, 1:]             # (6, 256) — skip CLS token
         return cls_attn.reshape(-1, self._n, self._n).cpu()
 
     @torch.no_grad()
@@ -68,8 +65,6 @@ class DinoExtractor(nn.Module):
                           discard_ratio=config.ROLLOUT_DISCARD_RATIO):
         """
         Attention rollout (Abnar & Zuidema 2020).
-        Propagates attention recursively through all layers, adding residual
-        connections and discarding the lowest-weight entries.
         Returns: float32 tensor (H_patches, W_patches)
         """
         outputs = self.model(pixel_values=pixel_values, output_attentions=True)
@@ -79,16 +74,14 @@ class DinoExtractor(nn.Module):
         result = torch.eye(seq, device=pixel_values.device)
 
         for attn in all_attns:
-            avg = attn[0].mean(dim=0)           # (seq, seq) mean over heads
+            avg = attn[0].mean(dim=0)           # (seq, seq)
 
-            # Zero out the bottom `discard_ratio` fraction of weights
             flat = avg.reshape(-1)
             k = int(flat.numel() * discard_ratio)
             if k > 0:
                 threshold = flat.kthvalue(k).values.item()
                 avg = avg.clamp(min=threshold)
 
-            # Add residual and re-normalise row-wise
             avg = avg + torch.eye(seq, device=pixel_values.device)
             avg = avg / (avg.sum(dim=-1, keepdim=True) + 1e-9)
 
@@ -99,29 +92,26 @@ class DinoExtractor(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Emotion ViT classifier
+#  Object classifier (ImageNet ViT-B/16)
 # ─────────────────────────────────────────────────────────────────────────────
-class EmotionClassifier(nn.Module):
+class ObjectClassifier(nn.Module):
     """
-    ViT-B/16 fine-tuned on FER+ for 7 facial emotion classes.
+    ViT-B/16 fine-tuned on ImageNet-1k (1000 classes).
 
     Provides:
-      • predict(pixel_values) → probabilities (num_classes,) numpy array
+      • predict(pixel_values) → (top_labels, top_probs, top1_global_idx)
       • get_attention(pixel_values) → (num_heads, H_p, W_p)
-      • labels : list[str]
     """
 
     def __init__(self):
         super().__init__()
-        self.processor = AutoImageProcessor.from_pretrained(config.EMOTION_MODEL_ID)
+        self.processor = AutoImageProcessor.from_pretrained(config.OBJECT_MODEL_ID)
         self.model = AutoModelForImageClassification.from_pretrained(
-            config.EMOTION_MODEL_ID,
+            config.OBJECT_MODEL_ID,
+            attn_implementation="eager",
         ).to(DEVICE)
         self.model.eval()
-
-        id2label = self.model.config.id2label
-        self.labels = [id2label[i] for i in range(len(id2label))]
-        self._n = config.EMOTION_PATCHES_PER_SIDE
+        self._n = config.OBJ_PATCHES_PER_SIDE
 
     def preprocess(self, pil_image):
         inputs = self.processor(images=pil_image, return_tensors="pt")
@@ -129,68 +119,28 @@ class EmotionClassifier(nn.Module):
 
     @torch.no_grad()
     def predict(self, pixel_values):
-        """Returns softmax probabilities as (num_classes,) numpy array."""
+        """
+        Returns top-K predictions.
+          top_labels        : list[str] of length OBJ_TOP_K
+          top_probs         : float32 array of length OBJ_TOP_K
+          top1_global_idx   : int, index into the full 1000-class logit vector
+                              (used by gradient-based XAI methods)
+        """
         out = self.model(pixel_values=pixel_values)
-        return torch.softmax(out.logits[0], dim=-1).cpu().numpy()
+        probs_all = torch.softmax(out.logits[0], dim=-1)
+        top = torch.topk(probs_all, config.OBJ_TOP_K)
+        indices = top.indices.cpu().tolist()
+        values  = top.values.cpu().numpy().astype(np.float32)
+        labels  = [self.model.config.id2label[i] for i in indices]
+        return labels, values, indices[0]
 
     @torch.no_grad()
     def get_attention(self, pixel_values):
         """
-        Last-layer CLS attention from the supervised emotion ViT.
+        Last-layer CLS attention from the object ViT.
         Returns: float32 tensor (num_heads, H_patches, W_patches)
         """
         out = self.model(pixel_values=pixel_values, output_attentions=True)
         last = out.attentions[-1]               # (1, 12, 197, 197)
         cls_attn = last[0, :, 0, 1:]            # (12, 196)
         return cls_attn.reshape(-1, self._n, self._n).cpu()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Face detector / cropper
-# ─────────────────────────────────────────────────────────────────────────────
-class FaceDetector:
-    """
-    MediaPipe face detection with padded crop.
-    Falls back to centre-crop if no face is found.
-    """
-
-    def __init__(self):
-        try:
-            import mediapipe as mp
-            self._detector = mp.solutions.face_detection.FaceDetection(
-                model_selection=1,
-                min_detection_confidence=config.FACE_CONFIDENCE,
-            )
-            self._use_mp = True
-        except Exception:
-            self._use_mp = False
-
-    def detect_and_crop(self, frame_rgb: np.ndarray):
-        """
-        Args:
-            frame_rgb: (H, W, 3) uint8 RGB array
-
-        Returns:
-            crop_rgb  : (crop_H, crop_W, 3) uint8 RGB, or center crop
-            bbox      : (x1, y1, x2, y2) absolute ints, or None
-        """
-        H, W = frame_rgb.shape[:2]
-
-        if self._use_mp:
-            results = self._detector.process(frame_rgb)
-            if results.detections:
-                det = results.detections[0]
-                bb = det.location_data.relative_bounding_box
-                pad = config.FACE_PADDING
-                x1 = int((bb.xmin - pad * bb.width) * W)
-                y1 = int((bb.ymin - pad * bb.height) * H)
-                x2 = int((bb.xmin + (1 + pad) * bb.width) * W)
-                y2 = int((bb.ymin + (1 + pad) * bb.height) * H)
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(W, x2), min(H, y2)
-                return frame_rgb[y1:y2, x1:x2].copy(), (x1, y1, x2, y2)
-
-        # Fallback: centre square crop
-        side = min(H, W)
-        y0, x0 = (H - side) // 2, (W - side) // 2
-        return frame_rgb[y0:y0+side, x0:x0+side].copy(), None

@@ -13,6 +13,16 @@ import config
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Font helper — uses Pillow 10+ load_default(size) with graceful fallback
+# ─────────────────────────────────────────────────────────────────────────────
+def _font(size: int):
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Core helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _normalize(x: np.ndarray) -> np.ndarray:
@@ -30,11 +40,13 @@ def _resize_map(x: np.ndarray, hw: tuple[int, int]) -> np.ndarray:
 
 
 def apply_colormap(x: np.ndarray,
-                   cmap_name: str = config.COLORMAP) -> np.ndarray:
+                   cmap_name: str | None = None) -> np.ndarray:
     """
     Apply a matplotlib colormap to a 2-D float map.
     Returns (H, W, 3) uint8 RGB.
     """
+    if cmap_name is None:
+        cmap_name = config.COLORMAP
     normed = _normalize(x)
     cmap = cm.get_cmap(cmap_name)
     rgb = (cmap(normed)[:, :, :3] * 255).astype(np.uint8)
@@ -43,13 +55,17 @@ def apply_colormap(x: np.ndarray,
 
 def overlay_heatmap(base_rgb: np.ndarray,
                     heatmap_2d: np.ndarray,
-                    alpha: float = config.OVERLAY_ALPHA_DEFAULT,
-                    cmap_name: str = config.COLORMAP) -> np.ndarray:
+                    alpha: float | None = None,
+                    cmap_name: str | None = None) -> np.ndarray:
     """
     Alpha-blend a heatmap over a base RGB image.
     heatmap_2d is resized to match base_rgb's dimensions.
     Returns (H, W, 3) uint8 RGB.
     """
+    if alpha is None:
+        alpha = config.OVERLAY_ALPHA_DEFAULT
+    if cmap_name is None:
+        cmap_name = config.COLORMAP
     h, w = base_rgb.shape[:2]
     resized = _resize_map(heatmap_2d, (h, w))
     colored = apply_colormap(resized, cmap_name)
@@ -62,9 +78,9 @@ def overlay_heatmap(base_rgb: np.ndarray,
 # ─────────────────────────────────────────────────────────────────────────────
 #  Individual panel builder
 # ─────────────────────────────────────────────────────────────────────────────
-_TITLE_BG  = (18, 22, 32)
-_TITLE_FG  = (180, 220, 255)
-_BORDER_C  = (40, 50, 70)
+_TITLE_BG  = (255, 255, 255)
+_TITLE_FG  = (20, 20, 20)
+_BORDER_C  = (220, 220, 220)
 _PANEL_PX  = config.PANEL_PX
 _LABEL_H   = config.LABEL_H
 
@@ -73,11 +89,13 @@ def make_panel(face_crop_rgb: np.ndarray,
                heatmap_2d: np.ndarray | None,
                title: str,
                size: int = _PANEL_PX,
-               alpha: float = config.OVERLAY_ALPHA_DEFAULT) -> np.ndarray:
+               alpha: float | None = None) -> np.ndarray:
     """
     Build a single labelled panel: face crop (+ optional heatmap) + title bar.
     Returns (size + LABEL_H, size, 3) uint8 RGB.
     """
+    if alpha is None:
+        alpha = config.OVERLAY_ALPHA_DEFAULT
     img = cv2.resize(face_crop_rgb, (size, size),
                      interpolation=cv2.INTER_LANCZOS4)
 
@@ -90,7 +108,7 @@ def make_panel(face_crop_rgb: np.ndarray,
 
     pil = Image.fromarray(panel)
     draw = ImageDraw.Draw(pil)
-    draw.text((6, size + 6), title, fill=_TITLE_FG)
+    draw.text((10, size + 10), title, fill=_TITLE_FG, font=_font(20))
 
     return np.array(pil)
 
@@ -98,52 +116,60 @@ def make_panel(face_crop_rgb: np.ndarray,
 # ─────────────────────────────────────────────────────────────────────────────
 #  Probability bar chart
 # ─────────────────────────────────────────────────────────────────────────────
-_BAR_BG    = (12, 16, 26)
-_BAR_NORM  = (60, 90, 160)
-_BAR_ACTIVE = (30, 210, 130)
-_TEXT_DIM  = (130, 150, 190)
-_TEXT_BRIGHT = (230, 240, 255)
+_BAR_BG     = (255, 255, 255)
+_BAR_NORM   = (210, 210, 210)
+_BAR_ACTIVE = (20, 20, 20)
+_TEXT_DIM   = (170, 170, 170)
+_TEXT_BRIGHT = (20, 20, 20)
 
 
 def make_prob_chart(labels: list[str],
                     probs: np.ndarray,
                     active_idx: int | None = None,
-                    width: int = 280,
+                    width: int = 360,
                     height: int = 320) -> np.ndarray:
     """
     Render a horizontal probability bar chart as a numpy RGB image.
+    Internally renders at 3× the requested dimensions for crisp text.
     """
+    S = 3  # render scale — downscaled by browser, never upscaled
     n = len(labels)
-    img = np.full((height, width, 3), _BAR_BG, dtype=np.uint8)
+    W, H     = width * S, height * S
+    label_w  = 100 * S
+    pct_w    = 52 * S
+    bar_zone = W - label_w - pct_w
 
-    usable_h = height - 20
-    row_h = max(10, usable_h // n)
-    bar_h = max(8, row_h - 8)
-    max_bar_w = width - 90
+    img = np.full((H, W, 3), _BAR_BG, dtype=np.uint8)
+
+    usable_h = H - 20 * S
+    row_h = max(10 * S, usable_h // n)
+    bar_h = max(8 * S, row_h - 10 * S)
+
+    font = _font(14 * S)
 
     pil = Image.fromarray(img)
     draw = ImageDraw.Draw(pil)
 
     for i, (lbl, p) in enumerate(zip(labels, probs)):
-        y_top = 10 + i * row_h
-        bar_w = int(max_bar_w * float(p))
+        y_top = 10 * S + i * row_h
+        bar_w = int(bar_zone * float(p))
         color = _BAR_ACTIVE if i == active_idx else _BAR_NORM
+        txt_col = _TEXT_BRIGHT if i == active_idx else _TEXT_DIM
 
         # Background track
-        draw.rectangle([80, y_top, 80 + max_bar_w, y_top + bar_h],
-                       fill=(25, 30, 50))
+        draw.rectangle([label_w, y_top, label_w + bar_zone, y_top + bar_h],
+                       fill=(230, 230, 230))
         # Value bar
         if bar_w > 0:
-            draw.rectangle([80, y_top, 80 + bar_w, y_top + bar_h], fill=color)
+            draw.rectangle([label_w, y_top, label_w + bar_w, y_top + bar_h],
+                           fill=color)
 
         # Label
-        lbl_short = lbl[:10]
-        txt_col = _TEXT_BRIGHT if i == active_idx else _TEXT_DIM
-        draw.text((2, y_top + 1), lbl_short, fill=txt_col)
+        draw.text((2 * S, y_top + S), lbl[:14], fill=txt_col, font=font)
 
-        # Probability value
-        draw.text((80 + max_bar_w + 4, y_top + 1),
-                  f"{p:.3f}", fill=txt_col)
+        # Probability as percentage
+        draw.text((label_w + bar_zone + 4 * S, y_top + S),
+                  f"{p:.1%}", fill=txt_col, font=font)
 
     return np.array(pil)
 
@@ -151,7 +177,7 @@ def make_prob_chart(labels: list[str],
 # ─────────────────────────────────────────────────────────────────────────────
 #  Grid assembler
 # ─────────────────────────────────────────────────────────────────────────────
-_GRID_BG = (8, 10, 18)
+_GRID_BG = (240, 240, 240)
 
 
 def assemble_grid(panels: list[np.ndarray],

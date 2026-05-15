@@ -13,6 +13,7 @@ All functions return:
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.ndimage import gaussian_filter
 
 import config
 
@@ -22,51 +23,32 @@ import config
 # ─────────────────────────────────────────────────────────────────────────────
 def vit_grad_cam(emotion_model, pixel_values, target_class: int) -> np.ndarray:
     """
-    Class-discriminative saliency via gradient of the target logit w.r.t. the
-    last encoder block's hidden states (Selvaraju et al. adapted for ViT).
+    Class-discriminative saliency for ViT.
+
+    In ViT the classifier reads only the CLS token (position 0), so
+    d_score/d_last_hidden[patch_k] == 0 for all k > 0 — the last-layer patch
+    hidden states are not in the score's computation graph.  We instead
+    differentiate w.r.t. the input pixels (always non-zero), then pool
+    pixel-level gradients to patch resolution.
 
     Returns: (H_patches, W_patches) float32 numpy array
     """
-    _activations = {}
-
-    def _fwd_hook(module, inp, out):
-        # ViTLayer output is a tuple: (hidden_states, [attn_weights])
-        h = out[0] if isinstance(out, tuple) else out
-        _activations["feat"] = h
-        h.retain_grad()
-
-    last_block = emotion_model.model.vit.encoder.layer[-1]
-    handle = last_block.register_forward_hook(_fwd_hook)
-
-    # Enable grad on input so the graph is built
     pv = pixel_values.detach().requires_grad_(True)
-    emotion_model.model.zero_grad()
 
-    try:
+    with torch.enable_grad():
         out = emotion_model.model(pixel_values=pv)
         score = out.logits[0, target_class]
-        score.backward()
-    finally:
-        handle.remove()
+        grad = torch.autograd.grad(score, pv)[0]   # (1, 3, 224, 224)
 
-    feat = _activations["feat"]          # (1, seq_len, hidden)
-    grad = feat.grad                     # (1, seq_len, hidden)
+    # L2 norm over colour channels → spatial sensitivity map
+    saliency = grad[0].norm(dim=0)                 # (224, 224)
 
-    if grad is None:
-        # Gradient didn't reach here; return blank map
-        n = config.EMOTION_PATCHES_PER_SIDE
-        return np.zeros((n, n), dtype=np.float32)
+    # Average-pool to patch grid so the output matches the attention map scale
+    n = config.OBJ_PATCHES_PER_SIDE
+    p = config.OBJ_PATCH_SIZE
+    cam = saliency.reshape(n, p, n, p).mean(dim=(1, 3))   # (n, n)
 
-    # Skip CLS token (index 0)
-    feat_patches = feat[0, 1:].detach()  # (num_patches, hidden)
-    grad_patches = grad[0, 1:].detach()  # (num_patches, hidden)
-
-    # Global average pool over hidden dim → importance weight per patch
-    weights = grad_patches.mean(dim=-1)  # (num_patches,)
-    cam = torch.relu((weights.unsqueeze(-1) * feat_patches).sum(dim=-1))
-
-    n = config.EMOTION_PATCHES_PER_SIDE
-    return cam.reshape(n, n).cpu().numpy().astype(np.float32)
+    return cam.cpu().numpy().astype(np.float32)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -100,8 +82,9 @@ def integrated_gradients(emotion_model, pixel_values, target_class: int,
         internal_batch_size=1,
     )
     # attrs: (1, 3, 224, 224)
-    # Reduce channels by L2 magnitude for a cleaner map
-    return attrs[0].norm(dim=0).detach().cpu().numpy().astype(np.float32)
+    # Reduce channels by L2 magnitude; smooth to remove patch-grid blockiness
+    raw = attrs[0].norm(dim=0).detach().cpu().numpy().astype(np.float32)
+    return gaussian_filter(raw, sigma=8.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -136,7 +119,8 @@ def smoothgrad(emotion_model, pixel_values, target_class: int,
         nt_samples=n_samples,
         stdevs=stdev,
     )
-    return attrs[0].abs().mean(dim=0).detach().cpu().numpy().astype(np.float32)
+    raw = attrs[0].abs().mean(dim=0).detach().cpu().numpy().astype(np.float32)
+    return gaussian_filter(raw, sigma=8.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -157,4 +141,32 @@ def gradient_x_input(emotion_model, pixel_values, target_class: int) -> np.ndarr
 
     grad = pv.grad[0]                  # (3, 224, 224)
     saliency = (grad * pv[0]).abs().mean(dim=0)   # (224, 224)
-    return saliency.detach().cpu().numpy().astype(np.float32)
+    raw = saliency.detach().cpu().numpy().astype(np.float32)
+    return gaussian_filter(raw, sigma=8.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Guided Backpropagation
+# ─────────────────────────────────────────────────────────────────────────────
+def guided_backprop(model_wrapper, pixel_values, target_class: int) -> np.ndarray:
+    """
+    Guided Backpropagation (Springenberg et al. 2015).
+    Zeros out negative gradients at each ReLU during the backward pass,
+    producing sharper attributions than vanilla gradients.
+    ViT uses GELU (no ReLU), so this is equivalent to plain gradient saliency
+    for the standard ViT-B/16 — but the output is still valid and meaningful.
+
+    Returns: (224, 224) float32 numpy array
+    """
+    try:
+        from captum.attr import GuidedBackprop
+    except ImportError:
+        raise RuntimeError("captum is required. pip install captum")
+
+    def _forward(x):
+        return model_wrapper.model(pixel_values=x).logits
+
+    gb = GuidedBackprop(_forward)
+    attrs = gb.attribute(pixel_values, target=target_class)
+    raw = attrs[0].abs().mean(dim=0).detach().cpu().numpy().astype(np.float32)
+    return gaussian_filter(raw, sigma=6.0)
