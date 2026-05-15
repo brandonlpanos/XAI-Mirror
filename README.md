@@ -1,4 +1,4 @@
-# XAI Face Lab 🔬
+# XAI Face Lab 
 
 **Multi-method, real-time explainability showcase for facial emotion recognition.**
 
